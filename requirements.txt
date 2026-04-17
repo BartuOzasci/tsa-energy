@@ -1,0 +1,25 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# Core Veri Manipülasyonu ve ML
+numpy>=1.24.3
+pandas>=2.0.3
+scikit-learn>=1.3.0
+
+# Görselleştirme (Evaluator Modülü İçin)
+matplotlib>=3.7.2
+seaborn>=0.12.2
+
+# Baseline Model (GPU Optimizasyonu Natively İçerir)
+xgboost>=2.0.0
+
+# Deep Learning (RTX 4060/5050 - CUDA 12.1 Uyumu)
+torch>=2.1.0
+transformers>=4.38.0
+accelerate>=0.27.2
+
+# Amazon Chronos Pipeline
+chronos-forecasting>=1.1.0
+
+# Data Loader ve Config Yardımcıları
+requests
+pydantic>=2.0.0
