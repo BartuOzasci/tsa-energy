@@ -51,6 +51,7 @@ class ChronosModel:
         config: type[Config] = Config,
         num_samples: int = 20,
         confidence_level: float = 0.9,
+        batch_size: int | None = None,
     ) -> None:
         """Initializes Chronos pipeline with hardware-aware defaults.
 
@@ -58,6 +59,8 @@ class ChronosModel:
             config: Configuration source class from src.config.
             num_samples: Number of trajectories sampled per forecast horizon.
             confidence_level: Central interval probability, e.g. 0.8 or 0.9.
+            batch_size: Contexts processed per GPU forward pass. Defaults to
+                Config.CHRONOS_BATCH_SIZE.
         """
         if num_samples <= 0:
             raise ValueError("num_samples must be a positive integer.")
@@ -72,6 +75,11 @@ class ChronosModel:
         self.num_samples: int = num_samples
         self.confidence_level: float = confidence_level
         self.torch_dtype: torch.dtype = torch.bfloat16
+        self.batch_size: int = (
+            batch_size
+            if batch_size is not None
+            else int(getattr(config, "CHRONOS_BATCH_SIZE", 8))
+        )
 
         self.pipeline: ChronosPipeline = self._initialize_pipeline()
 
@@ -200,51 +208,50 @@ class ChronosModel:
             return median_np[0], low_np[0], high_np[0]
         return median_np, low_np, high_np
 
-    def _truncate_context_for_vram(
-        self,
-        prepared_context: torch.Tensor | list[torch.Tensor],
-    ) -> torch.Tensor | list[torch.Tensor]:
-        """Limits context length to reduce activation memory on constrained GPUs."""
-        max_context: int = max(1, int(self.context_length))
-
-        if isinstance(prepared_context, torch.Tensor):
-            if prepared_context.ndim == 1:
-                return prepared_context[-max_context:]
-            if prepared_context.ndim == 2:
-                # Use only the latest context window to keep inference within VRAM limits.
-                return prepared_context[-1:, -max_context:]
-            raise ValueError("Prepared tensor context must be 1D or 2D.")
-
-        if isinstance(prepared_context, list):
-            return [prepared_context[-1][-max_context:]]
-
-        raise TypeError("Unsupported prepared context type.")
-
     def _predict_single_context(self, context: torch.Tensor) -> torch.Tensor:
-        """Runs Chronos prediction for a single context window."""
-        try:
-            raw_forecast: Any = self.pipeline.predict(
-                context,
-                prediction_length=self.prediction_length,
-                num_samples=self.num_samples,
-                limit_prediction_length=False,
-            )
-        except TypeError:
-            raw_forecast = self.pipeline.predict(
-                context,
-                prediction_length=self.prediction_length,
-                num_samples=self.num_samples,
-            )
+        """Runs Chronos prediction for a single context or small batch."""
+        with torch.inference_mode():
+            try:
+                raw_forecast: Any = self.pipeline.predict(
+                    context,
+                    prediction_length=self.prediction_length,
+                    num_samples=self.num_samples,
+                    limit_prediction_length=False,
+                )
+            except TypeError:
+                raw_forecast = self.pipeline.predict(
+                    context,
+                    prediction_length=self.prediction_length,
+                    num_samples=self.num_samples,
+                )
 
         forecast_samples: torch.Tensor = torch.as_tensor(raw_forecast)
         return self._ensure_sample_axis(forecast_samples)
+
+    def _predict_batched(self, contexts: torch.Tensor) -> torch.Tensor:
+        """Processes all context rows in batch_size chunks for GPU efficiency.
+
+        Truncates each batch to context_length to keep activation memory bounded.
+        Processing in fixed-size batches keeps GPU utilization high while
+        preventing fragmentation on 8GB VRAM cards.
+        """
+        sample_batches: list[torch.Tensor] = []
+        max_ctx: int = self.context_length
+        n_rows: int = contexts.shape[0]
+
+        for start in range(0, n_rows, self.batch_size):
+            end: int = min(start + self.batch_size, n_rows)
+            batch: torch.Tensor = contexts[start:end, -max_ctx:]
+            sample_batches.append(self._predict_single_context(batch))
+
+        return torch.cat(sample_batches, dim=0)
 
     def predict(self, context_series: ContextInput) -> ForecastOutput:
         """Generates probabilistic Chronos forecasts from historical context.
 
         Chronos treats numeric sequences as discrete token streams and samples
-        multiple future trajectories. This method aggregates those trajectories
-        into a robust central forecast and uncertainty bands.
+        multiple future trajectories. All windows are processed in GPU batches
+        of batch_size to maximise throughput without exceeding VRAM limits.
 
         Args:
             context_series: 1D target history (single or batch form).
@@ -255,27 +262,18 @@ class ChronosModel:
         prepared_context: torch.Tensor | list[torch.Tensor] = self._prepare_context(
             context_series
         )
-        prepared_context = self._truncate_context_for_vram(prepared_context)
 
         if isinstance(prepared_context, torch.Tensor) and prepared_context.ndim == 2:
-            if prepared_context.shape[0] == 1:
-                forecast_samples = self._predict_single_context(prepared_context)
-            else:
-                sample_batches: list[torch.Tensor] = []
-                for row_idx in range(prepared_context.shape[0]):
-                    single_context: torch.Tensor = prepared_context[row_idx].unsqueeze(0)
-                    sample_batches.append(self._predict_single_context(single_context))
-                forecast_samples = torch.cat(sample_batches, dim=0)
+            forecast_samples = self._predict_batched(prepared_context)
         elif isinstance(prepared_context, list):
-            sample_batches = []
-            for context in prepared_context:
-                sample_batches.append(self._predict_single_context(context.unsqueeze(0)))
-            forecast_samples = torch.cat(sample_batches, dim=0)
+            stacked: list[torch.Tensor] = [c[-self.context_length:] for c in prepared_context]
+            all_contexts: torch.Tensor = torch.stack(stacked, dim=0)
+            forecast_samples = self._predict_batched(all_contexts)
+        elif isinstance(prepared_context, torch.Tensor):
+            single: torch.Tensor = prepared_context[-self.context_length:].unsqueeze(0)
+            forecast_samples = self._predict_single_context(single)
         else:
-            if isinstance(prepared_context, torch.Tensor):
-                forecast_samples = self._predict_single_context(prepared_context)
-            else:
-                raise TypeError("Unsupported prepared context type.")
+            raise TypeError("Unsupported prepared context type.")
 
         return self._compute_prediction_bands(forecast_samples)
 

@@ -1,7 +1,3 @@
-import os
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import gc
 import logging
 import time
@@ -270,6 +266,7 @@ def main() -> None:
         chronos_model = ChronosModel(
             num_samples=int(getattr(Config, "CHRONOS_NUM_SAMPLES", 20)),
             confidence_level=float(getattr(Config, "CHRONOS_CONFIDENCE_LEVEL", 0.9)),
+            batch_size=int(getattr(Config, "CHRONOS_BATCH_SIZE", 8)),
         )
         chronos_start: float = time.perf_counter()
         median_pred, low_band, high_band = chronos_model.predict(test_contexts)
@@ -289,8 +286,35 @@ def main() -> None:
                 test_horizons[-1].detach().cpu().numpy().astype(np.float64).reshape(-1)
             )
             chronos_timestamps = processed_df.index[-len(chronos_true) :].to_numpy()
+        elif median_arr.ndim == 2:
+            # Strided batched run: flatten all non-overlapping windows to cover
+            # the full test period rather than evaluating a single horizon.
+            n_windows, pred_len = median_arr.shape
+            chronos_pred = median_arr.reshape(-1)
+            chronos_low = low_arr.reshape(-1)
+            chronos_high = high_arr.reshape(-1)
+            chronos_true = (
+                test_horizons.detach().cpu().numpy().astype(np.float64).reshape(-1)
+            )
+            stride: int = data_loader.prediction_length
+            series_split_idx: int = int(len(processed_df) * (1.0 - data_loader.test_size))
+            ts_list: list = []
+            for k in range(n_windows):
+                win_start: int = series_split_idx + k * stride
+                win_end: int = win_start + pred_len
+                if win_end <= len(processed_df):
+                    ts_list.extend(processed_df.index[win_start:win_end].tolist())
+            chronos_timestamps = np.array(ts_list)
+            n_valid: int = min(
+                len(chronos_timestamps), len(chronos_pred), len(chronos_true)
+            )
+            chronos_pred = chronos_pred[:n_valid]
+            chronos_low = chronos_low[:n_valid]
+            chronos_high = chronos_high[:n_valid]
+            chronos_true = chronos_true[:n_valid]
+            chronos_timestamps = chronos_timestamps[:n_valid]
         else:
-            # Batched Chronos run returns per-window horizons; use one-step alignment.
+            # Fallback: first-step alignment for any unexpected shape.
             chronos_pred = _first_horizon_step(median_arr)
             chronos_low = _first_horizon_step(low_arr)
             chronos_high = _first_horizon_step(high_arr)
