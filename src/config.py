@@ -88,11 +88,9 @@ class RuntimeConfig:
         if self.device.type != "cuda":
             return
 
-        os.environ.setdefault(
-            "PYTORCH_CUDA_ALLOC_CONF",
-            "max_split_size_mb:128,expandable_segments:True",
-        )
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
         if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -109,7 +107,7 @@ class XGBoostConfig:
     objective: str = "reg:squarederror"
     eval_metric: str = "rmse"
     learning_rate: float = 0.025
-    max_depth: int = 10
+    max_depth: int = 8
     n_estimators: int = 1800
     subsample: float = 0.90
     colsample_bytree: float = 0.85
@@ -146,12 +144,12 @@ class XGBoostConfig:
 class ChronosConfig:
     """Chronos-T5 defaults tuned for 8GB VRAM inference/training stability."""
 
-    model_id: str = "amazon/chronos-t5-mini"
+    model_id: str = "amazon/chronos-t5-base"
     torch_dtype: torch.dtype = torch.bfloat16
-    context_length: int = 512
+    context_length: int = 1024
     prediction_length: int = 24
-    batch_size: int = 8
-    num_samples: int = 64
+    batch_size: int = 16
+    num_samples: int = 32
     confidence_level: float = 0.9
 
 

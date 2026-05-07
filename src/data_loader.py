@@ -77,6 +77,9 @@ class DataLoader:
         self.feature_scaler: Scaler = self._build_scaler(scaler_kind)
         self.target_scaler: Scaler = self._build_scaler(scaler_kind)
 
+        self._raw_cache: pd.DataFrame | None = None
+        self._cleaned_cache: pd.DataFrame | None = None
+
     @staticmethod
     def _build_scaler(kind: Literal["standard", "minmax"]) -> Scaler:
         """Creates a scaler instance from a short family name.
@@ -127,8 +130,16 @@ class DataLoader:
         Complexity:
             O(n) with n as row count.
         """
-        raw_path: Path = self.download_data()
-        return pd.read_csv(raw_path)
+        if self._raw_cache is None:
+            raw_path: Path = self.download_data()
+            self._raw_cache = pd.read_csv(raw_path)
+        return self._raw_cache.copy()
+
+    def _get_cleaned(self) -> pd.DataFrame:
+        """Returns preprocessed DataFrame, computing and caching on first call."""
+        if self._cleaned_cache is None:
+            self._cleaned_cache = self.preprocess_data(self.load_raw_data())
+        return self._cleaned_cache
 
     def preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """Cleans a raw dataset and converts it into indexed time series format.
@@ -174,7 +185,11 @@ class DataLoader:
         return frame
 
     def _lag_steps(self) -> list[int]:
-        """Builds lag step values including critical lags such as 1, 2 and 24.
+        """Builds lag step values including dense recent lags and seasonal anchors.
+
+        Dense range covers max_lag_features steps; seasonal anchors (daily for
+        both hourly/30-min data, and weekly for both resolutions) are always
+        included regardless of max_lag to capture periodic structure.
 
         Returns:
             Sorted lag step list.
@@ -184,8 +199,9 @@ class DataLoader:
         """
         max_lag: int = max(1, self.max_lag_features)
         lag_steps: set[int] = set(range(1, max_lag + 1))
-        lag_steps.update({1, 2, 24})
-        return sorted(step for step in lag_steps if step <= max_lag)
+        # Seasonal anchors: daily (24h/48×30min) and weekly (168h/336×30min)
+        lag_steps.update({1, 2, 24, 48, 168, 336})
+        return sorted(lag_steps)
 
     @staticmethod
     def _rolling_windows(max_lag: int) -> list[int]:
@@ -200,7 +216,7 @@ class DataLoader:
         Complexity:
             O(1), fixed candidate list.
         """
-        candidates: tuple[int, ...] = (3, 6, 12, 24)
+        candidates: tuple[int, ...] = (3, 6, 12, 24, 48)
         windows: list[int] = [window for window in candidates if window <= max_lag]
         return windows if windows else [3]
 
@@ -363,8 +379,7 @@ class DataLoader:
         Complexity:
             O(n * (L + W + m)) for feature creation and scaling.
         """
-        raw_df: pd.DataFrame = self.load_raw_data()
-        cleaned_df: pd.DataFrame = self.preprocess_data(raw_df)
+        cleaned_df: pd.DataFrame = self._get_cleaned()
         featured_df: pd.DataFrame = self.engineer_features(cleaned_df)
 
         train_df, test_df = self.split_train_test(featured_df)
@@ -389,18 +404,26 @@ class DataLoader:
 
         return x_train, y_train, x_test, y_test
 
-    def _build_chronos_windows(self, series: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _build_chronos_windows(
+        self,
+        series: np.ndarray,
+        stride: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Converts a 1D time series into context/horizon window pairs.
 
         Args:
             series: One-dimensional target array.
+            stride: Step between consecutive windows. Defaults to
+                prediction_length (non-overlapping) for efficient batched
+                inference. Use stride=1 for dense sliding-window evaluation.
 
         Returns:
             contexts, horizons arrays aligned for Chronos-style forecasting.
 
         Complexity:
-            O(n * (context_length + prediction_length)).
+            O(n/stride * (context_length + prediction_length)).
         """
+        effective_stride: int = self.prediction_length if stride is None else max(1, stride)
         min_required: int = self.context_length + self.prediction_length
         if series.size < min_required:
             raise ValueError(
@@ -410,7 +433,11 @@ class DataLoader:
 
         contexts: list[np.ndarray] = []
         horizons: list[np.ndarray] = []
-        for end_idx in range(self.context_length, series.size - self.prediction_length + 1):
+        for end_idx in range(
+            self.context_length,
+            series.size - self.prediction_length + 1,
+            effective_stride,
+        ):
             start_idx: int = end_idx - self.context_length
             contexts.append(series[start_idx:end_idx])
             horizons.append(series[end_idx : end_idx + self.prediction_length])
@@ -431,8 +458,7 @@ class DataLoader:
         Complexity:
             O(n * (context_length + prediction_length)).
         """
-        raw_df: pd.DataFrame = self.load_raw_data()
-        cleaned_df: pd.DataFrame = self.preprocess_data(raw_df)
+        cleaned_df: pd.DataFrame = self._get_cleaned()
 
         series: np.ndarray = cleaned_df[self.target_column].to_numpy(dtype=np.float32)
         split_idx: int = int(series.size * (1.0 - self.test_size))
